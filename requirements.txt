@@ -1,0 +1,15 @@
+langchain
+langchain-community
+langchain-huggingface
+langchain-core
+langchain-google-genai
+
+chromadb
+
+pypdf
+transformers
+
+word2number
+
+gradio
+python-dotenv
