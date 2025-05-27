@@ -1,6 +1,6 @@
 BASE_PATH="C:\\Users\\sahil\\Desktop\\hpe chatbot\\pdf"
 Data_PATH="C:\\Users\\sahil\\Desktop\\hpe chatbot\\data\\new_dump1.json"
 CHROMA_DB_PATH = "./chroma_db"
-# BASE_MODEL="gemma2:9b"
-BASE_MODEL="gemini-1.5-flash"
+BASE_MODEL="gemma2:9b"
+# BASE_MODEL="gemini-1.5-flash"
 EMBEDDING_MODEL="BAAI/bge-small-en-v1.5"
