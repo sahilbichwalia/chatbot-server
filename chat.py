@@ -540,95 +540,320 @@ def get_lowest_servers_by_peak(query: str = "") -> str:
     return result
 
 def calculate_carbon_footprint(query: str) -> str:
+    """
+    Calculate carbon footprint for servers based on natural language query.
+    Can handle requests for specific servers or all servers with different grid types.
+    
+    Args:
+        query: Natural language query that may contain:
+               - Server serial number (e.g. "server ABC123")
+               - Carbon intensity type (e.g. "low carbon", "average", "high carbon")
+    
+    Returns:
+        Formatted string with carbon footprint results
+    """
+    if not processed_server_data:
+        return "No server data available."
+    
+    # Default values
+    server_serial = None
+    carbon_intensity = 'average_grid'
+    num_servers_to_show = extract_server_count(query, default=10)
+    
+    # Improved server serial extraction (using same logic as get_server_timestamps)
+    server_patterns = [r'server\s+([A-Za-z0-9_-]+)', r'([A-Za-z0-9_-]{5,})']
+    
+    for pattern in server_patterns:
+        match = re.search(pattern, query, re.IGNORECASE)
+        if match:
+            potential_serial = match.group(1).upper()
+            if potential_serial in processed_server_data:
+                server_serial = potential_serial
+                break
+    
+    # Fallback: check if any server serial appears directly in query
+    if not server_serial:
+        query_upper = query.upper()
+        for serial_key in processed_server_data.keys():
+            if serial_key in query_upper:
+                server_serial = serial_key
+                break
+    
+    # Parse carbon intensity preference
     query_lower = query.lower()
-    server_serial_to_calc = None
-    carbon_intensity_key = 'average_grid'
-    serial_match = re.search(r"server\s+([A-Z0-9-]+)", query_lower, re.IGNORECASE)
-    if serial_match:
-        potential_serial = serial_match.group(1).upper()
-        if potential_serial in processed_server_data:
-            server_serial_to_calc = potential_serial
-    if "low carbon" in query_lower or "renewable" in query_lower: carbon_intensity_key = 'low_carbon_grid'
-    elif "high carbon" in query_lower or "coal" in query_lower: carbon_intensity_key = 'high_carbon_grid'
-    intensity_factor = DEFAULT_CARBON_INTENSITY[carbon_intensity_key]
-    results_list = []
-    servers_to_process = [server_serial_to_calc] if server_serial_to_calc and server_serial_to_calc in processed_server_data else list(processed_server_data.keys())
-    if not servers_to_process: return "No servers specified or found for carbon footprint calculation."
-    if server_serial_to_calc and server_serial_to_calc not in processed_server_data:
-        return f"Server {server_serial_to_calc} not found. Cannot calculate carbon footprint."
-    num_servers_float = extract_server_count(query)
-    total_co2_fleet = 0.0
+    if "low carbon" in query_lower or "renewable" in query_lower:
+        carbon_intensity = 'low_carbon_grid'
+    elif "high carbon" in query_lower or "coal" in query_lower:
+        carbon_intensity = 'high_carbon_grid'
+    
+    # Validate carbon intensity input
+    if carbon_intensity not in DEFAULT_CARBON_INTENSITY:
+        return f"Invalid carbon intensity. Choose from: {', '.join(DEFAULT_CARBON_INTENSITY.keys())}"
+    
+    intensity_factor = DEFAULT_CARBON_INTENSITY[carbon_intensity]
+    total_co2 = 0.0
+    results = []
+    
+    # Determine which servers to process
+    servers_to_process = [server_serial] if server_serial else processed_server_data.keys()
+    
     for serial in servers_to_process:
-        server_info = processed_server_data.get(serial)
-        if not server_info: continue
-        energy_kwh = server_info.get("estimated_energy_kwh", 0.0)
-        if energy_kwh == 0.0:
-            if server_serial_to_calc:
-                if not server_info.get("all_records") or not any(r.get("cpu_util") is not None for r in server_info.get("all_records",[])):
-                    return f"Server {serial} has no CPU utilization data to estimate energy. Cannot calculate carbon footprint."
-                return f"Server {serial} has negligible estimated energy consumption ({energy_kwh} kWh). Carbon footprint is effectively zero."
-            continue # Skip for fleet calculation if no energy
+        if serial not in processed_server_data:
+            continue
+            
+        server_data = processed_server_data[serial]
+        energy_kwh = server_data.get("estimated_energy_kwh", 0)
+        
+        # Skip servers with insufficient data
+        if energy_kwh == 0:
+            continue
+        
+        # Calculate CO2 emissions
         co2_kg = energy_kwh * intensity_factor
-        total_co2_fleet += co2_kg
-        avg_cpu = server_info.get("avg_cpu_util")
-        avg_est_power = server_info.get("avg_est_power")
-        power_cpu_ratio = float('inf')
-        if avg_cpu is not None and avg_cpu > 0 and avg_est_power is not None and avg_est_power > 0:
-            power_cpu_ratio = avg_est_power / avg_cpu
-        efficiency_rating = 'poor'
-        thresholds = EFFICIENCY_THRESHOLDS['cpu_power_ratio']
-        if power_cpu_ratio <= thresholds['excellent']: efficiency_rating = 'excellent'
-        elif power_cpu_ratio <= thresholds['good']: efficiency_rating = 'good'
-        elif power_cpu_ratio <= thresholds['average']: efficiency_rating = 'average'
-        results_list.append({"serial": serial, "energy_kwh": round(energy_kwh, 2), "co2_kg": round(co2_kg, 2),
-                             "avg_cpu": avg_cpu if avg_cpu is not None else "N/A",
-                             "avg_est_power": avg_est_power if avg_est_power is not None else "N/A",
-                             "efficiency": efficiency_rating, "carbon_intensity_key": carbon_intensity_key})
-    if not results_list:
-        if server_serial_to_calc: return f"Could not calculate carbon footprint for server {server_serial_to_calc}. It may have no relevant energy data."
-        return f"No valid server data for carbon footprint calculation with '{carbon_intensity_key.replace('_',' ')}' grid."
-    if server_serial_to_calc:
-        res = next((r for r in results_list if r['serial'] == server_serial_to_calc), None)
-        if not res: return f"No carbon footprint data for server {server_serial_to_calc} (negligible energy)."
-        result = f"Carbon footprint for server {res['serial']} ({res['carbon_intensity_key'].replace('_', ' ')} grid):\n\n"
-        result += f"   - Energy Consumed: {res['energy_kwh']} kWh\n"
-        result += f"   - CO2 Emissions: {res['co2_kg']} kg\n"
-        result += f"   - Average CPU Utilization: {res['avg_cpu']}%\n"
-        result += f"   - Average Estimated Power: {res.get('avg_est_power', 'N/A')}W\n"
-        result += f"   - Efficiency Rating: {res['efficiency'].capitalize()}\n"
-        return result
-    sorted_results = sorted(results_list, key=lambda x: x["co2_kg"], reverse=True)
-    available_servers = len(sorted_results)
-    if num_servers_float == float('inf') or not isinstance(num_servers_float, (int, float)) or num_servers_float > available_servers :
-        actual_count = available_servers
-        num_to_show = available_servers
+        total_co2 += co2_kg
+        
+        # Get efficiency rating
+        avg_cpu = server_data["avg_cpu_util"]
+        
+        # Special case for 0% utilization
+        if avg_cpu == 0:
+            efficiency = "idle"
+        else:
+            # Calculate power ratio only for active servers
+            power_ratio = estimate_power(avg_cpu) / (50 + (300 - 50) * (avg_cpu/100))
+            
+            efficiency = "poor"  # Default to poor
+            for rating, threshold in EFFICIENCY_THRESHOLDS["cpu_power_ratio"].items():
+                if power_ratio <= threshold:
+                    efficiency = rating
+                    break
+        
+        results.append({
+            "serial": serial,
+            "energy_kwh": round(energy_kwh, 2),
+            "co2_kg": round(co2_kg, 2),
+            "avg_cpu": avg_cpu,
+            "efficiency": efficiency,
+            "carbon_intensity": carbon_intensity
+        })
+    
+    if not results:
+        if server_serial:
+            # If specific server was requested but no data found
+            available_servers = list(processed_server_data.keys())
+            return f"Could not find data for server {server_serial}. Available servers: {', '.join(available_servers[:3])}{'...' if len(available_servers) > 3 else ''}"
+        else:
+            return "No valid server data available for carbon footprint calculation."
+    
+    # Format the results
+    if server_serial:
+        # Single server detailed output
+        result = next((r for r in results if r["serial"] == server_serial), None)
+        if not result:
+            return f"No carbon footprint data available for server {server_serial}."
+        
+        output = f"Carbon footprint analysis for server {server_serial}:\n\n"
+        output += f"   - Energy Consumed: {result['energy_kwh']} kWh\n"
+        output += f"   - CO2 Emissions: {result['co2_kg']} kg\n"
+        output += f"   - Carbon Intensity: {carbon_intensity.replace('_', ' ').title()} ({intensity_factor} kg CO2/kWh)\n"
+        output += f"   - Average CPU Utilization: {result['avg_cpu']}%\n"
+        
+        if result['efficiency'] == 'idle':
+            output += "   - Energy Efficiency: Server is idle (0% CPU utilization)\n"
+        else:
+            output += f"   - Energy Efficiency Rating: {result['efficiency'].capitalize()}\n"
+            
+        return output
+    
     else:
-        num_to_show = int(num_servers_float)
-        actual_count = min(num_to_show, available_servers)
-    grid_type_str = carbon_intensity_key.replace('_', ' ')
-    result_header = ""
-    if num_to_show == 1 and actual_count == 1 and available_servers > 1 :
-         result_header = f"Server with highest CO2 emissions ({grid_type_str} grid):\n\n"
-    elif num_servers_float == float('inf') or num_to_show >= available_servers:
-         result_header = f"Carbon footprint for all {actual_count} servers ({grid_type_str} grid):\n\n"
+        # Multiple servers summary output
+        grid_type_display = carbon_intensity.replace('_', ' ').title()
+        available_servers = len(results)
+        
+        output = f"Carbon footprint summary for all {available_servers} servers ({grid_type_display}):\n\n"
+        output += f"   - Total CO2 Emissions: {round(total_co2, 2)} kg\n"
+        output += f"   - Average per Server: {round(total_co2/available_servers, 2)} kg\n\n"
+        
+        if num_servers_to_show == float('inf'):
+            # Show all servers
+            top_count = available_servers
+            output += f"All {available_servers} servers:\n\n"
+        else:
+            # Show requested number of servers
+            top_count = min(int(num_servers_to_show), available_servers)
+            output += f"Top {top_count} highest emitting servers:\n\n"
+        
+        # Add top N highest emitters
+        sorted_results = sorted(results, key=lambda x: x["co2_kg"], reverse=True)
+        
+        for i, res in enumerate(sorted_results[:top_count]):
+            output += f"{i+1}. Server {res['serial']}:\n"
+            output += f"   - CO2 Emissions: {res['co2_kg']} kg\n"
+            output += f"   - Energy Consumed: {res['energy_kwh']} kWh\n"
+            output += f"   - CPU Utilization: {res['avg_cpu']}%\n"
+            output += f"   - Efficiency Rating: {res['efficiency'].capitalize()}\n\n"
+                
+        # Add efficiency distribution
+        eff_dist = {}
+        for res in results:
+            eff_dist[res["efficiency"]] = eff_dist.get(res["efficiency"], 0) + 1
+        
+        output += "Energy efficiency distribution:\n\n"
+        for eff, count in sorted(eff_dist.items()):
+            percentage = round((count / available_servers) * 100, 1)
+            output += f"   - {eff.capitalize()}: {count} servers ({percentage}%)\n"
+    
+    return output
+
+def calculate_carbon_footprint_lowest(query: str) -> str:
+    """
+    Calculate carbon footprint for servers based on natural language query.
+    Can handle requests for specific servers or all servers with different grid types.
+    Shows LOWEST CO2 emitting servers by default.
+    
+    Args:
+        query: Natural language query that may contain:
+               - Server serial number (e.g. "server ABC123")
+               - Carbon intensity type (e.g. "low carbon", "average", "high carbon")
+               - Number of servers to show (e.g. "top 5", "show 15")
+    
+    Returns:
+        Formatted string with carbon footprint results (lowest emitters first)
+    """
+    # Default values
+    server_serial = None
+    carbon_intensity = 'average_grid'
+    num_servers_to_show = extract_server_count(query, default=10)
+    
+    # Parse query for server serial
+    query_lower = query.lower()
+    if "server" in query_lower:
+        # Extract potential serial number after "server"
+        parts = query_lower.split("server")
+        if len(parts) > 1:
+            potential_serial = parts[1].strip().upper()
+            if potential_serial in processed_server_data:
+                server_serial = potential_serial
+    
+    # Parse carbon intensity preference
+    if "low carbon" in query_lower or "renewable" in query_lower:
+        carbon_intensity = 'low_carbon_grid'
+    elif "high carbon" in query_lower or "coal" in query_lower:
+        carbon_intensity = 'high_carbon_grid'
+    
+    # Validate carbon intensity input
+    if carbon_intensity not in DEFAULT_CARBON_INTENSITY:
+        return f"Invalid carbon intensity. Choose from: {', '.join(DEFAULT_CARBON_INTENSITY.keys())}"
+    
+    intensity_factor = DEFAULT_CARBON_INTENSITY[carbon_intensity]
+    total_co2 = 0.0
+    results = []
+    
+    # Determine which servers to process
+    servers_to_process = [server_serial] if server_serial else processed_server_data.keys()
+    
+    for serial in servers_to_process:
+        if serial not in processed_server_data:
+            continue
+            
+        server_data = processed_server_data[serial]
+        energy_kwh = server_data.get("estimated_energy_kwh", 0)
+        
+        # Skip servers with insufficient data
+        if energy_kwh == 0:
+            continue
+        
+        # Calculate CO2 emissions
+        co2_kg = energy_kwh * intensity_factor
+        total_co2 += co2_kg
+        
+        # Get efficiency rating
+        avg_cpu = server_data["avg_cpu_util"]
+        
+        # Special case for 0% utilization
+        if avg_cpu == 0:
+            efficiency = "idle"
+        else:
+            # Calculate power ratio only for active servers
+            power_ratio = estimate_power(avg_cpu) / (50 + (300 - 50) * (avg_cpu/100))
+            
+            efficiency = "poor"  # Default to poor
+            for rating, threshold in EFFICIENCY_THRESHOLDS["cpu_power_ratio"].items():
+                if power_ratio <= threshold:
+                    efficiency = rating
+                    break
+        
+        results.append({
+            "serial": serial,
+            "energy_kwh": round(energy_kwh, 2),
+            "co2_kg": round(co2_kg, 2),
+            "avg_cpu": avg_cpu,
+            "efficiency": efficiency,
+            "carbon_intensity": carbon_intensity
+        })
+    
+    if not results:
+        return "No valid server data available for carbon footprint calculation."
+    
+    # Format the results
+    if server_serial:
+        # Single server detailed output
+        result = next((r for r in results if r["serial"] == server_serial), None)
+        if not result:
+            return f"No data available for server {server_serial}."
+        
+        output = f"Carbon footprint analysis for server {server_serial}:\n\n"
+        output += f"   - Energy Consumed: {result['energy_kwh']} kWh\n"
+        output += f"   - CO2 Emissions: {result['co2_kg']} kg\n"
+        output += f"   - Carbon Intensity: {carbon_intensity.replace('_', ' ').title()} ({intensity_factor} kg CO2/kWh)\n"
+        output += f"   - Average CPU Utilization: {result['avg_cpu']}%\n"
+        
+        if result['efficiency'] == 'idle':
+            output += "   - Energy Efficiency: Server is idle (0% CPU utilization)\n"
+        else:
+            output += f"   - Energy Efficiency Rating: {result['efficiency'].capitalize()}\n"
+            
+        return output
+    
     else:
-         result_header = f"Top {actual_count} of {num_to_show} requested servers by CO2 emissions ({grid_type_str} grid):\n\n"
-    result = result_header
-    if actual_count > 0 and len(results_list) > 1 :
-        result += f"Fleet Summary ({len(results_list)} servers with energy data):\n"
-        result += f"   - Total CO2 Emissions: {round(total_co2_fleet, 2)} kg\n"
-        avg_co2_per_server = round(total_co2_fleet / len(results_list), 2) if results_list else 0
-        result += f"   - Average CO2 per Server: {avg_co2_per_server} kg\n\n"
-    for i, res in enumerate(sorted_results[:actual_count]):
-        result += f"{i+1}. Server {res['serial']}:\n"
-        result += f"   - CO2 Emissions: {res['co2_kg']} kg\n"
-        result += f"   - Energy Consumed: {res['energy_kwh']} kWh\n"
-        result += f"   - Average CPU Utilization: {res['avg_cpu']}%\n"
-        result += f"   - Average Estimated Power: {res.get('avg_est_power', 'N/A')}W\n"
-        result += f"   - Efficiency Rating: {res['efficiency'].capitalize()}\n\n"
-    if num_to_show > available_servers and num_servers_float != float('inf'):
-        result += f"Note: Requested {num_to_show}, but only {available_servers} have relevant energy data.\n"
-    return result
+        # Multiple servers summary output - LOWEST emitters
+        grid_type_display = carbon_intensity.replace('_', ' ').title()
+        available_servers = len(results)
+        
+        output = f"Carbon footprint summary for all {available_servers} servers ({grid_type_display}):\n\n"
+        output += f"   - Total CO2 Emissions: {round(total_co2, 2)} kg\n"
+        output += f"   - Average per Server: {round(total_co2/available_servers, 2)} kg\n\n"
+        
+        if num_servers_to_show == float('inf'):
+            # Show all servers
+            top_count = available_servers
+            output += f"All {available_servers} servers (lowest to highest emissions):\n\n"
+        else:
+            # Show requested number of servers
+            top_count = min(int(num_servers_to_show), available_servers)
+            output += f"Top {top_count} LOWEST emitting servers:\n\n"
+        
+        # Sort by LOWEST emissions (ascending order)
+        sorted_results = sorted(results, key=lambda x: x["co2_kg"], reverse=False)
+        
+        for i, res in enumerate(sorted_results[:top_count]):
+            output += f"{i+1}. Server {res['serial']}:\n"
+            output += f"   - CO2 Emissions: {res['co2_kg']} kg\n"
+            output += f"   - Energy Consumed: {res['energy_kwh']} kWh\n"
+            output += f"   - CPU Utilization: {res['avg_cpu']}%\n"
+            output += f"   - Efficiency Rating: {res['efficiency'].capitalize()}\n\n"
+                
+        # Add efficiency distribution
+        eff_dist = {}
+        for res in results:
+            eff_dist[res["efficiency"]] = eff_dist.get(res["efficiency"], 0) + 1
+        
+        output += "Energy efficiency distribution:\n\n"
+        for eff, count in sorted(eff_dist.items()):
+            percentage = round((count / available_servers) * 100, 1)
+            output += f"   - {eff.capitalize()}: {count} servers ({percentage}%)\n"
+    
+    return output
 
 def get_server_stats(query: str) -> str:
     specific_server_serial = None
@@ -1387,7 +1612,6 @@ tools = [
             "Triggers include: 'List all servers', 'Show servers being monitored', 'What servers are active?'. "
             "Returns a human-readable summary of all monitored servers, including:\n"
             "Use this tool to list all monitored servers. "
-            "list all the server"
             "Input should be an empty string. "
             "Example: Action: ListAllServers[]"
             "- Serial number\n"
@@ -1403,7 +1627,6 @@ tools = [
     func=get_top_servers_by_cpu_util,
     description=(
         "Use this tool to retrieve servers with the highest CPU utilization. "
-        "which server have highest cpu utlization"
         "Extracts how many top servers to show from the query (default: 10; 'all' returns all). "
         "including numeric words such as 'one server', 'two servers', 'three servers', etc. (default: 10; 'all' returns all). "
         "tell me the top 100 server which have highest cpu utlization\n "
@@ -1428,7 +1651,6 @@ tools = [
     func=get_lowest_servers_by_cpu_util,
     description=(
         "Use this tool to find servers with the lowest CPU utilization. It extracts how many servers to show from the user's query, "
-        "which server have lowest cpu utlization"
         "including numeric words such as 'one server', 'two servers', 'three servers', etc. (default: 10; 'all' returns all). "
          "tell me the top 100 server which have Lowest cpu utlization\n "
          "tell me the top 100 server which have Lowest cpu utlization if the count of server is greater tahn list server then return default\n "
@@ -1452,7 +1674,6 @@ Tool(
     func=get_top_servers_by_ambient_temp,
     description=(
         "Use this tool to find servers ranked by their highest ambient temperature records. "
-        "which server have highest  ambient temperature"
         "It interprets the user's query to extract how many top servers to show, including numeric words such as "
          "tell me the top 100 server which have highest Ambient Temprature\n "
          "tell me the top 100 server which have highest Ambient Temprature if the count of server is greater tahn list server then return default\n "
@@ -1478,7 +1699,6 @@ Tool(
     func=get_lowest_servers_by_ambient_temp,
     description=(
         "Use this tool to find servers ranked by their lowest ambient temperature records. "
-        "which server have lowest ambient temprature"
          "tell me the top 100 server which have lowest ambient temperature\n "
          "tell me the top 100 server which have lowest ambient temperature if the count of server is greater tahn list server then return default\n "
         "It interprets the user's query to extract how many bottom servers to show, including numeric words such as "
@@ -1504,7 +1724,6 @@ Tool(
     func=get_top_servers_by_peak,
     description=(
         "Use this tool to retrieve servers with the highest peak values across all metrics. "
-        "which sever have highest peak value"
         "The number of top servers to show is extracted from the user query. "
         "tell me the top 100 server which have highest peak values\n "
          "tell me the top 100 server which have highest peak values if the count of server is greater tahn list server then return default\n "
@@ -1530,7 +1749,6 @@ Tool(
     func=get_lowest_servers_by_peak,
     description=(
         "Use this tool to retrieve servers with the lowest peak values across all metrics. "
-        "which server have lowest peak value"
         "The number of servers to show is extracted from the user query. "
          "tell me the top 100 server which have  Lowest peak values\n "
          "tell me the top 100 server which have lowest peak values if the count of server is greater tahn list server then return default\n "
@@ -1590,7 +1808,7 @@ Tool(
         "(e.g., 'renewable', 'coal', 'low carbon', etc.). It extracts server serial numbers, counts (like 'top 5', 'ten servers', or 'all'), "
         "and optionally filters by grid type.\n\n"
         "If a specific server is mentioned (e.g., 'Server ABC123'), it will return the carbon footprint details for that server only.\n"
-        "If a number of top servers are requested, it returns those with the highest CO₂ emissions.\n\n"
+        "If a number of top servers are requested, it returns those with the HIGHEST CO₂ emissions.\n\n"
         "Example queries:\n"
         "- 'What is the carbon footprint of server ABC123?'\n"
         "- 'Show CO2 emissions for all servers using renewable energy.'\n"
@@ -1602,13 +1820,43 @@ Tool(
         "- Energy Consumed (kWh)\n"
         "- CO₂ Emissions (kg)\n"
         "- Average CPU Utilization (%)\n"
-        "- Average Estimated Power (Watts)\n"
         "- Efficiency Rating (based on CPU-to-power ratio)\n\n"
         "Also returns a fleet summary when multiple servers are included.\n\n"
         "Format: Action: CalculateCarbonFootprint[\"<query>\"]"
     ),
     return_direct=True
 ),
+
+Tool(
+    name="CalculateCarbonFootprintLowest",
+    func=calculate_carbon_footprint_lowest,
+    description=(
+        "Use this tool to calculate the carbon footprint of one or more servers based on estimated energy consumption, "
+        "specifically showing servers with the LOWEST CO₂ emissions.\n\n"
+        "The tool determines whether to use 'average', 'low-carbon', or 'high-carbon' grid intensity based on keywords in the query "
+        "(e.g., 'renewable', 'coal', 'low carbon', etc.). It extracts server serial numbers, counts (like 'top 5', 'ten servers', or 'all'), "
+        "and optionally filters by grid type.\n\n"
+        "If a specific server is mentioned (e.g., 'Server ABC123'), it will return the carbon footprint details for that server only.\n"
+        "If a number of top servers are requested, it returns those with the LOWEST CO₂ emissions (most energy-efficient).\n\n"
+        "Example queries:\n"
+        "- 'Show me the 10 most energy-efficient servers'\n"
+        "- 'Which servers have the lowest carbon footprint?'\n"
+        "- 'Top 5 cleanest servers using renewable energy'\n"
+        "- 'List servers with minimum CO2 emissions'\n"
+        "- 'Show least polluting servers'\n"
+        "- 'Most efficient servers by carbon footprint'\n\n"
+        "Returns for each server:\n"
+        "- Serial number\n"
+        "- Energy Consumed (kWh)\n"
+        "- CO₂ Emissions (kg)\n"
+        "- Average CPU Utilization (%)\n"
+        "- Efficiency Rating (based on CPU-to-power ratio)\n\n"
+        "Also returns a fleet summary when multiple servers are included, with efficiency distribution.\n\n"
+        "Format: Action: CalculateCarbonFootprintLowest[\"<query>\"]"
+    ),
+    return_direct=True
+),
+
 Tool(
     name="IdentifyHighCPUServers",
     func=identify_high_cpu_servers,
