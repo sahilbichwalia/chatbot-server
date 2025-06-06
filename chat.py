@@ -373,6 +373,200 @@ def get_top_servers_by_cpu_util(query: str = "") -> str:
     if num_to_show > available_servers and num_servers_float != float('inf'):
         result += f"Note: Requested {num_to_show}, but only {available_servers} servers have relevant data.\n"
     return result
+def get_specific_server_cpu_utilization(query: str) -> str:
+    """
+    Get CPU utilization data for specific server(s) with robust server identification.
+    Can handle single or multiple servers in one query.
+    
+    Args:
+        query: Natural language query containing:
+               - One or more server serial numbers (e.g. "server SGH227WTNK and ABC123", "SGH227WTNK, DEF456")
+               - CPU utilization request
+    
+    Returns:
+        Formatted string with CPU utilization data for the specified server(s)
+        or error message if server(s) not found
+    """
+    if not processed_server_data:
+        return "No server data available."
+    
+    found_servers = []
+    
+    # Robust server serial extraction with multiple patterns
+    server_patterns = [
+        r'server\s+([A-Za-z0-9_-]+)',  # "server ABC123"
+        r'([A-Za-z0-9]{6,})',          # Direct alphanumeric codes like "SGH227WTNK"
+        r'([A-Za-z0-9_-]{5,})'         # Alphanumeric with underscores/hyphens
+    ]
+    
+    # Collect all potential server matches
+    potential_servers = set()
+    
+    # Try each pattern to find all server serials
+    for pattern in server_patterns:
+        matches = re.findall(pattern, query, re.IGNORECASE)
+        for match in matches:
+            potential_serial = match.upper().strip()
+            # Check if this serial exists in our data
+            if potential_serial in processed_server_data:
+                potential_servers.add(potential_serial)
+    
+    # Fallback: check if any known server serial appears directly in query
+    query_upper = query.upper()
+    for serial_key in processed_server_data.keys():
+        # Check for exact match or serial as substring with word boundaries
+        if re.search(r'\b' + re.escape(serial_key) + r'\b', query_upper):
+            potential_servers.add(serial_key)
+    
+    # Additional fallback: fuzzy matching for common typos
+    if not potential_servers:
+        # Split query into potential server tokens
+        tokens = re.findall(r'[A-Za-z0-9]{5,}', query)
+        for token in tokens:
+            token_clean = re.sub(r'[^A-Za-z0-9]', '', token.upper())
+            if len(token_clean) >= 5:
+                for serial_key in processed_server_data.keys():
+                    serial_clean = re.sub(r'[^A-Za-z0-9]', '', serial_key)
+                    # Check if cleaned token matches cleaned serial
+                    if token_clean == serial_clean:
+                        potential_servers.add(serial_key)
+                        break
+    
+    found_servers = list(potential_servers)
+    
+    # If no servers found, return helpful error message
+    if not found_servers:
+        available_servers = list(processed_server_data.keys())
+        sample_servers = ', '.join(available_servers[:5])
+        if len(available_servers) > 5:
+            sample_servers += f" (and {len(available_servers) - 5} more)"
+        
+        return (f"No servers found in query. Please check the server serial number(s).\n\n"
+                f"Available servers include: {sample_servers}\n"
+                f"Example usage: 'CPU utilization for server {available_servers[0]}' or "
+                f"'{available_servers[0]} and {available_servers[1]} CPU utilization'")
+    
+    # Get CPU utilization data for all found servers
+    results = []
+    servers_with_data = 0
+    
+    for server_serial in sorted(found_servers):
+        server_data = processed_server_data[server_serial]
+        
+        # Check if CPU utilization data exists
+        if not server_data.get("peak_cpu_record"):
+            results.append({
+                "serial": server_serial,
+                "error": "No CPU utilization data available"
+            })
+            continue
+        
+        peak_cpu_record = server_data["peak_cpu_record"]
+        
+        # Get the peak CPU utilization from server rankings if available
+        peak_cpu_util = None
+        if server_rankings.get("top_cpu"):
+            for serial, cpu_util in server_rankings["top_cpu"]:
+                if serial == server_serial:
+                    peak_cpu_util = cpu_util
+                    break
+        
+        # Fallback to peak_cpu_record if not found in rankings
+        if peak_cpu_util is None:
+            peak_cpu_util = peak_cpu_record.get("cpu_util", "N/A")
+        
+        # Calculate efficiency rating
+        avg_cpu = server_data.get("avg_cpu_util", 0)
+        if avg_cpu == 0:
+            efficiency = "idle"
+        else:
+            # Calculate power ratio only for active servers
+            power_ratio = estimate_power(avg_cpu) / (50 + (300 - 50) * (avg_cpu/100))
+            
+            efficiency = "poor"  # Default to poor
+            for rating, threshold in EFFICIENCY_THRESHOLDS["cpu_power_ratio"].items():
+                if power_ratio <= threshold:
+                    efficiency = rating
+                    break
+        
+        # Get server ranking position if available
+        ranking_position = "N/A"
+        if server_rankings.get("top_cpu"):
+            for i, (serial, _) in enumerate(server_rankings["top_cpu"]):
+                if serial == server_serial:
+                    ranking_position = f"#{i+1}"
+                    break
+        
+        servers_with_data += 1
+        
+        results.append({
+            "serial": server_serial,
+            "peak_cpu_util": peak_cpu_util,
+            "avg_cpu_util": avg_cpu,
+            "timestamp": peak_cpu_record.get("time_str", "N/A"),
+            "power_consumption": peak_cpu_record.get("power_consumption", "N/A"),
+            "temperature": peak_cpu_record.get("temperature", "N/A"),
+            "fan_speed": peak_cpu_record.get("fan_speed", "N/A"),
+            "efficiency": efficiency,
+            "ranking_position": ranking_position
+        })
+    
+    # Format output based on number of servers
+    if len(found_servers) == 1:
+        # Single server detailed output
+        result = results[0]
+        if "error" in result:
+            return f"Server {result['serial']}: {result['error']}"
+        
+        output = f"CPU utilization data for server {result['serial']}:\n\n"
+        output += f"   - Peak CPU Utilization: {result['peak_cpu_util']}%\n"
+        output += f"   - Average CPU Utilization: {result['avg_cpu_util']}%\n"
+        output += f"   - Timestamp of Peak: {result['timestamp']}\n"
+        output += f"   - Power Consumption at Peak: {result['power_consumption']}W\n"
+        output += f"   - Temperature at Peak: {result['temperature']}°C\n"
+        output += f"   - Fan Speed at Peak: {result['fan_speed']} RPM\n"
+        output += f"   - CPU Efficiency Rating: {result['efficiency'].capitalize()}\n"
+        output += f"   - Fleet Ranking: {result['ranking_position']}\n"
+        
+    else:
+        # Multiple servers output
+        output = f"CPU utilization data for {len(found_servers)} specified servers:\n\n"
+        
+        if servers_with_data > 0:
+            # Calculate summary statistics
+            valid_peak_cpus = [r["peak_cpu_util"] for r in results if "error" not in r and r["peak_cpu_util"] is not None]
+            valid_avg_cpus = [r["avg_cpu_util"] for r in results if "error" not in r and r["avg_cpu_util"] is not None]
+            
+            if valid_peak_cpus:
+                highest_peak = max(valid_peak_cpus)
+                lowest_peak = min(valid_peak_cpus)
+                avg_peak = sum(valid_peak_cpus) / len(valid_peak_cpus)
+                
+                output += f"   - Highest Peak CPU Among Servers: {highest_peak}%\n"
+                output += f"   - Lowest Peak CPU Among Servers: {lowest_peak}%\n"
+                output += f"   - Average Peak CPU: {round(avg_peak, 2)}%\n"
+            
+            if valid_avg_cpus:
+                overall_avg = sum(valid_avg_cpus) / len(valid_avg_cpus)
+                output += f"   - Overall Average CPU Utilization: {round(overall_avg, 2)}%\n\n"
+        
+        output += "Individual server details:\n\n"
+        
+        for i, result in enumerate(results, 1):
+            if "error" in result:
+                output += f"{i}. Server {result['serial']}: {result['error']}\n\n"
+            else:
+                output += f"{i}. Server {result['serial']} (Rank: {result['ranking_position']}):\n"
+                output += f"   - Peak CPU: {result['peak_cpu_util']}%\n"
+                output += f"   - Average CPU: {result['avg_cpu_util']}%\n"
+                output += f"   - Peak Timestamp: {result['timestamp']}\n"
+                output += f"   - Peak Power: {result['power_consumption']}W\n"
+                output += f"   - Peak Temperature: {result['temperature']}°C\n"
+                output += f"   - Peak Fan Speed: {result['fan_speed']} RPM\n"
+                output += f"   - Efficiency: {result['efficiency'].capitalize()}\n\n"
+    
+    return output
+
 
 def get_lowest_servers_by_cpu_util(query: str = "") -> str:
     if not server_rankings.get("bottom_cpu"):
@@ -440,6 +634,166 @@ def get_top_servers_by_ambient_temp(query: str = "") -> str:
         result += f"Note: Requested {num_to_show}, but only {available_servers} servers have relevant data.\n"
     return result
 
+def get_specific_server_ambient_temp(query: str) -> str:
+    """
+    Get ambient temperature data for specific server(s) with robust server identification.
+    Can handle single or multiple servers in one query.
+    
+    Args:
+        query: Natural language query containing:
+               - One or more server serial numbers (e.g. "server SGH227WTNK and ABC123", "SGH227WTNK, DEF456")
+               - Ambient temperature request
+    
+    Returns:
+        Formatted string with ambient temperature data for the specified server(s)
+        or error message if server(s) not found
+    """
+    if not processed_server_data:
+        return "No server data available."
+    
+    found_servers = []
+    
+    # Robust server serial extraction with multiple patterns
+    server_patterns = [
+        r'server\s+([A-Za-z0-9_-]+)',  # "server ABC123"
+        r'([A-Za-z0-9]{6,})',          # Direct alphanumeric codes like "SGH227WTNK"
+        r'([A-Za-z0-9_-]{5,})'         # Alphanumeric with underscores/hyphens
+    ]
+    
+    # Collect all potential server matches
+    potential_servers = set()
+    
+    # Try each pattern to find all server serials
+    for pattern in server_patterns:
+        matches = re.findall(pattern, query, re.IGNORECASE)
+        for match in matches:
+            potential_serial = match.upper().strip()
+            # Check if this serial exists in our data
+            if potential_serial in processed_server_data:
+                potential_servers.add(potential_serial)
+    
+    # Fallback: check if any known server serial appears directly in query
+    query_upper = query.upper()
+    for serial_key in processed_server_data.keys():
+        # Check for exact match or serial as substring with word boundaries
+        if re.search(r'\b' + re.escape(serial_key) + r'\b', query_upper):
+            potential_servers.add(serial_key)
+    
+    # Additional fallback: fuzzy matching for common typos
+    if not potential_servers:
+        # Split query into potential server tokens
+        tokens = re.findall(r'[A-Za-z0-9]{5,}', query)
+        for token in tokens:
+            token_clean = re.sub(r'[^A-Za-z0-9]', '', token.upper())
+            if len(token_clean) >= 5:
+                for serial_key in processed_server_data.keys():
+                    serial_clean = re.sub(r'[^A-Za-z0-9]', '', serial_key)
+                    # Check if cleaned token matches cleaned serial
+                    if token_clean == serial_clean:
+                        potential_servers.add(serial_key)
+                        break
+    
+    found_servers = list(potential_servers)
+    
+    # If no servers found, return helpful error message
+    if not found_servers:
+        available_servers = list(processed_server_data.keys())
+        sample_servers = ', '.join(available_servers[:5])
+        if len(available_servers) > 5:
+            sample_servers += f" (and {len(available_servers) - 5} more)"
+        
+        return (f"No servers found in query. Please check the server serial number(s).\n\n"
+                f"Available servers include: {sample_servers}\n"
+                f"Example usage: 'ambient temperature for server {available_servers[0]}' or "
+                f"'{available_servers[0]} and {available_servers[1]} ambient temperature'")
+    
+    # Get ambient temperature data for all found servers
+    results = []
+    servers_with_data = 0
+    
+    for server_serial in sorted(found_servers):
+        server_data = processed_server_data[server_serial]
+        
+        # Check if ambient temperature data exists
+        if not server_data.get("max_temp_record"):
+            results.append({
+                "serial": server_serial,
+                "error": "No ambient temperature data available"
+            })
+            continue
+        
+        temp_record = server_data["max_temp_record"]
+        # Get the max ambient temperature from server rankings if available
+        max_ambient_temp = None
+        if server_rankings.get("top_amb_temp"):
+            for serial, temp in server_rankings["top_amb_temp"]:
+                if serial == server_serial:
+                    max_ambient_temp = temp
+                    break
+        
+        # Fallback to temp_record if not found in rankings
+        if max_ambient_temp is None:
+            max_ambient_temp = temp_record.get("amb_temp", "N/A")
+        
+        servers_with_data += 1
+        
+        results.append({
+            "serial": server_serial,
+            "max_ambient_temp": max_ambient_temp,
+            "timestamp": temp_record.get("time_str", "N/A"),
+            "cpu_util": temp_record.get("cpu_util", "N/A"),
+            "cpu_watts": temp_record.get("cpu_watts", "N/A"),
+            "dimm_watts": temp_record.get("dimm_watts", "N/A"),
+            "avg_ambient_temp": server_data.get("avg_ambient_temp", "N/A")
+        })
+    
+    # Format output based on number of servers
+    if len(found_servers) == 1:
+        # Single server detailed output
+        result = results[0]
+        if "error" in result:
+            return f"Server {result['serial']}: {result['error']}"
+        
+        output = f"Ambient temperature data for server {result['serial']}:\n\n"
+        output += f"   - Highest Ambient Temperature: {result['max_ambient_temp']}°C\n"
+        output += f"   - Timestamp of Peak: {result['timestamp']}\n"
+        output += f"   - Average Ambient Temperature: {result['avg_ambient_temp']}°C\n"
+        output += f"   - CPU Utilization at Peak: {result['cpu_util']}%\n"
+        output += f"   - CPU Power at Peak: {result['cpu_watts']}W\n"
+        output += f"   - DIMM Power at Peak: {result['dimm_watts']}W\n"
+        
+    else:
+        # Multiple servers output
+        output = f"Ambient temperature data for {len(found_servers)} specified servers:\n\n"
+        
+        if servers_with_data > 0:
+            # Calculate summary statistics
+            valid_max_temps = [r["max_ambient_temp"] for r in results if "error" not in r and r["max_ambient_temp"] is not None]
+            if valid_max_temps:
+                avg_max_temp = sum(valid_max_temps) / len(valid_max_temps)
+                highest_temp = max(valid_max_temps)
+                lowest_temp = min(valid_max_temps)
+                
+                output += f"   - Highest Temperature Among Servers: {highest_temp}°C\n"
+                output += f"   - Lowest Temperature Among Servers: {lowest_temp}°C\n"
+                output += f"   - Average Maximum Temperature: {round(avg_max_temp, 2)}°C\n\n"
+        
+        output += "Individual server details:\n\n"
+        
+        for i, result in enumerate(results, 1):
+            if "error" in result:
+                output += f"{i}. Server {result['serial']}: {result['error']}\n\n"
+            else:
+                output += f"{i}. Server {result['serial']}:\n"
+                output += f"   - Highest Ambient Temp: {result['max_ambient_temp']}°C\n"
+                output += f"   - Average Ambient Temp: {result['avg_ambient_temp']}°C\n"
+                output += f"   - Peak Timestamp: {result['timestamp']}\n"
+                output += f"   - CPU Util at Peak: {result['cpu_util']}%\n"
+                output += f"   - CPU Power at Peak: {result['cpu_watts']}W\n"
+                output += f"   - DIMM Power at Peak: {result['dimm_watts']}W\n\n"
+    
+    return output
+
 def get_lowest_servers_by_ambient_temp(query: str = "") -> str:
     if not server_rankings.get("bottom_amb_temp"):
         return "No ambient temperature data available for ranking lowest servers."
@@ -506,6 +860,167 @@ def get_top_servers_by_peak(query: str = "") -> str:
         result += f"Note: Requested {num_to_show}, but only {available_servers} servers have relevant data.\n"
     return result
 
+def get_specific_server_peak_data(query: str) -> str:
+    """
+    Get peak data for specific server(s) with robust server identification.
+    Can handle single or multiple servers in one query.
+    
+    Args:
+        query: Natural language query containing:
+               - One or more server serial numbers (e.g. "server SGH227WTNK and ABC123", "SGH227WTNK, DEF456")
+               - Peak data request
+    
+    Returns:
+        Formatted string with peak data for the specified server(s)
+        or error message if server(s) not found
+    """
+    if not processed_server_data:
+        return "No server data available."
+    
+    found_servers = []
+    
+    # Robust server serial extraction with multiple patterns
+    server_patterns = [
+        r'server\s+([A-Za-z0-9_-]+)',  # "server ABC123"
+        r'([A-Za-z0-9]{6,})',          # Direct alphanumeric codes like "SGH227WTNK"
+        r'([A-Za-z0-9_-]{5,})'         # Alphanumeric with underscores/hyphens
+    ]
+    
+    # Collect all potential server matches
+    potential_servers = set()
+    
+    # Try each pattern to find all server serials
+    for pattern in server_patterns:
+        matches = re.findall(pattern, query, re.IGNORECASE)
+        for match in matches:
+            potential_serial = match.upper().strip()
+            # Check if this serial exists in our data
+            if potential_serial in processed_server_data:
+                potential_servers.add(potential_serial)
+    
+    # Fallback: check if any known server serial appears directly in query
+    query_upper = query.upper()
+    for serial_key in processed_server_data.keys():
+        # Check for exact match or serial as substring with word boundaries
+        if re.search(r'\b' + re.escape(serial_key) + r'\b', query_upper):
+            potential_servers.add(serial_key)
+    
+    # Additional fallback: fuzzy matching for common typos
+    if not potential_servers:
+        # Split query into potential server tokens
+        tokens = re.findall(r'[A-Za-z0-9]{5,}', query)
+        for token in tokens:
+            token_clean = re.sub(r'[^A-Za-z0-9]', '', token.upper())
+            if len(token_clean) >= 5:
+                for serial_key in processed_server_data.keys():
+                    serial_clean = re.sub(r'[^A-Za-z0-9]', '', serial_key)
+                    # Check if cleaned token matches cleaned serial
+                    if token_clean == serial_clean:
+                        potential_servers.add(serial_key)
+                        break
+    
+    found_servers = list(potential_servers)
+    
+    # If no servers found, return helpful error message
+    if not found_servers:
+        available_servers = list(processed_server_data.keys())
+        sample_servers = ', '.join(available_servers[:5])
+        if len(available_servers) > 5:
+            sample_servers += f" (and {len(available_servers) - 5} more)"
+        
+        return (f"No servers found in query. Please check the server serial number(s).\n\n"
+                f"Available servers include: {sample_servers}\n"
+                f"Example usage: 'peak data for server {available_servers[0]}' or "
+                f"'{available_servers[0]} and {available_servers[1]} peak values'")
+    
+    # Get peak data for all found servers
+    results = []
+    servers_with_data = 0
+    
+    for server_serial in sorted(found_servers):
+        server_data = processed_server_data[server_serial]
+        
+        # Check if peak data exists
+        if not server_data.get("max_peak_record"):
+            results.append({
+                "serial": server_serial,
+                "error": "No peak data available"
+            })
+            continue
+        
+        peak_record = server_data["max_peak_record"]
+        # Get the max peak value from server rankings if available
+        max_peak_value = None
+        if server_rankings.get("top_peak"):
+            for serial, peak_val in server_rankings["top_peak"]:
+                if serial == server_serial:
+                    max_peak_value = peak_val
+                    break
+        
+        # Fallback to peak_record if not found in rankings
+        if max_peak_value is None:
+            max_peak_value = peak_record.get("peak_value", "N/A")
+        
+        servers_with_data += 1
+        
+        results.append({
+            "serial": server_serial,
+            "max_peak_value": max_peak_value,
+            "timestamp": peak_record.get("time_str", "N/A"),
+            "cpu_util": peak_record.get("cpu_util", "N/A"),
+            "amb_temp": peak_record.get("amb_temp", "N/A"),
+            "cpu_watts": peak_record.get("cpu_watts", "N/A"),
+            "avg_peak_value": server_data.get("avg_peak_value", "N/A")
+        })
+    
+    # Format output based on number of servers
+    if len(found_servers) == 1:
+        # Single server detailed output
+        result = results[0]
+        if "error" in result:
+            return f"Server {result['serial']}: {result['error']}"
+        
+        output = f"Peak data for server {result['serial']}:\n\n"
+        output += f"   - Highest Peak Value: {result['max_peak_value']}\n"
+        output += f"   - Timestamp of Peak: {result['timestamp']}\n"
+        output += f"   - Average Peak Value: {result['avg_peak_value']}\n"
+        output += f"   - CPU Utilization at Peak: {result['cpu_util']}%\n"
+        output += f"   - Ambient Temperature at Peak: {result['amb_temp']}°C\n"
+        output += f"   - CPU Power at Peak: {result['cpu_watts']}W\n"
+        
+    else:
+        # Multiple servers output
+        output = f"Peak data for {len(found_servers)} specified servers:\n\n"
+        
+        if servers_with_data > 0:
+            # Calculate summary statistics
+            valid_peak_values = [r["max_peak_value"] for r in results if "error" not in r and r["max_peak_value"] is not None]
+            if valid_peak_values:
+                avg_peak = sum(valid_peak_values) / len(valid_peak_values)
+                highest_peak = max(valid_peak_values)
+                lowest_peak = min(valid_peak_values)
+                
+                output += f"   - Highest Peak Value Among Servers: {highest_peak}\n"
+                output += f"   - Lowest Peak Value Among Servers: {lowest_peak}\n"
+                output += f"   - Average Peak Value: {round(avg_peak, 2)}\n\n"
+        
+        output += "Individual server details:\n\n"
+        
+        for i, result in enumerate(results, 1):
+            if "error" in result:
+                output += f"{i}. Server {result['serial']}: {result['error']}\n\n"
+            else:
+                output += f"{i}. Server {result['serial']}:\n"
+                output += f"   - Highest Peak Value: {result['max_peak_value']}\n"
+                output += f"   - Average Peak Value: {result['avg_peak_value']}\n"
+                output += f"   - Peak Timestamp: {result['timestamp']}\n"
+                output += f"   - CPU Util at Peak: {result['cpu_util']}%\n"
+                output += f"   - Ambient Temp at Peak: {result['amb_temp']}°C\n"
+                output += f"   - CPU Power at Peak: {result['cpu_watts']}W\n\n"
+    
+    return output
+
+
 def get_lowest_servers_by_peak(query: str = "") -> str:
     if not server_rankings.get("bottom_peak"):
         return "No peak data available for ranking lowest servers."
@@ -541,43 +1056,23 @@ def get_lowest_servers_by_peak(query: str = "") -> str:
 
 def calculate_carbon_footprint(query: str) -> str:
     """
-    Calculate carbon footprint for servers based on natural language query.
-    Can handle requests for specific servers or all servers with different grid types.
+    Calculate carbon footprint for multiple servers or fleet-wide analysis.
+    Handles requests for all servers or top N servers with different grid types.
     
     Args:
         query: Natural language query that may contain:
-               - Server serial number (e.g. "server ABC123")
                - Carbon intensity type (e.g. "low carbon", "average", "high carbon")
+               - Number of servers to show (e.g. "top 5", "all servers")
     
     Returns:
-        Formatted string with carbon footprint results
+        Formatted string with carbon footprint results for multiple servers
     """
     if not processed_server_data:
         return "No server data available."
     
     # Default values
-    server_serial = None
     carbon_intensity = 'average_grid'
     num_servers_to_show = extract_server_count(query, default=10)
-    
-    # Improved server serial extraction (using same logic as get_server_timestamps)
-    server_patterns = [r'server\s+([A-Za-z0-9_-]+)', r'([A-Za-z0-9_-]{5,})']
-    
-    for pattern in server_patterns:
-        match = re.search(pattern, query, re.IGNORECASE)
-        if match:
-            potential_serial = match.group(1).upper()
-            if potential_serial in processed_server_data:
-                server_serial = potential_serial
-                break
-    
-    # Fallback: check if any server serial appears directly in query
-    if not server_serial:
-        query_upper = query.upper()
-        for serial_key in processed_server_data.keys():
-            if serial_key in query_upper:
-                server_serial = serial_key
-                break
     
     # Parse carbon intensity preference
     query_lower = query.lower()
@@ -594,13 +1089,8 @@ def calculate_carbon_footprint(query: str) -> str:
     total_co2 = 0.0
     results = []
     
-    # Determine which servers to process
-    servers_to_process = [server_serial] if server_serial else processed_server_data.keys()
-    
-    for serial in servers_to_process:
-        if serial not in processed_server_data:
-            continue
-            
+    # Process all servers
+    for serial in processed_server_data.keys():
         server_data = processed_server_data[serial]
         energy_kwh = server_data.get("estimated_energy_kwh", 0)
         
@@ -638,70 +1128,217 @@ def calculate_carbon_footprint(query: str) -> str:
         })
     
     if not results:
-        if server_serial:
-            # If specific server was requested but no data found
-            available_servers = list(processed_server_data.keys())
-            return f"Could not find data for server {server_serial}. Available servers: {', '.join(available_servers[:3])}{'...' if len(available_servers) > 3 else ''}"
-        else:
-            return "No valid server data available for carbon footprint calculation."
+        return "No valid server data available for carbon footprint calculation."
     
-    # Format the results
-    if server_serial:
-        # Single server detailed output
-        result = next((r for r in results if r["serial"] == server_serial), None)
-        if not result:
-            return f"No carbon footprint data available for server {server_serial}."
+    # Multiple servers summary output
+    grid_type_display = carbon_intensity.replace('_', ' ').title()
+    available_servers = len(results)
+    
+    output = f"Carbon footprint summary for all {available_servers} servers ({grid_type_display}):\n\n"
+    output += f"   - Total CO2 Emissions: {round(total_co2, 2)} kg\n"
+    output += f"   - Average per Server: {round(total_co2/available_servers, 2)} kg\n\n"
+    
+    if num_servers_to_show == float('inf'):
+        # Show all servers
+        top_count = available_servers
+        output += f"All {available_servers} servers:\n\n"
+    else:
+        # Show requested number of servers
+        top_count = min(int(num_servers_to_show), available_servers)
+        output += f"Top {top_count} highest emitting servers:\n\n"
+    
+    # Add top N highest emitters
+    sorted_results = sorted(results, key=lambda x: x["co2_kg"], reverse=True)
+    
+    for i, res in enumerate(sorted_results[:top_count]):
+        output += f"{i+1}. Server {res['serial']}:\n"
+        output += f"   - CO2 Emissions: {res['co2_kg']} kg\n"
+        output += f"   - Energy Consumed: {res['energy_kwh']} kWh\n"
+        output += f"   - CPU Utilization: {res['avg_cpu']}%\n"
+        output += f"   - Efficiency Rating: {res['efficiency'].capitalize()}\n\n"
+            
+    # Add efficiency distribution
+    eff_dist = {}
+    for res in results:
+        eff_dist[res["efficiency"]] = eff_dist.get(res["efficiency"], 0) + 1
+    
+    output += "Energy efficiency distribution:\n\n"
+    for eff, count in sorted(eff_dist.items()):
+        percentage = round((count / available_servers) * 100, 1)
+        output += f"   - {eff.capitalize()}: {count} servers ({percentage}%)\n"
+
+    return output
+
+
+def co2_emission_server(query: str) -> str:
+    """
+    Calculate carbon footprint for specific server(s) with robust server identification.
+    Can handle single or multiple servers in one query.
+    
+    Args:
+        query: Natural language query containing:
+               - One or more server serial numbers (e.g. "server SGH227WTNK and ABC123", "SGH227WTNK, DEF456")
+               - Optional carbon intensity type (e.g. "low carbon", "average", "high carbon")
+    
+    Returns:
+        Formatted string with carbon footprint results for the specified server(s)
+        or error message if server(s) not found
+    """
+    if not processed_server_data:
+        return "No server data available."
+    
+    # Default carbon intensity
+    carbon_intensity = 'average_grid'
+    found_servers = []
+    
+    # Parse carbon intensity preference
+    query_lower = query.lower()
+    if "low carbon" in query_lower or "renewable" in query_lower:
+        carbon_intensity = 'low_carbon_grid'
+    elif "high carbon" in query_lower or "coal" in query_lower:
+        carbon_intensity = 'high_carbon_grid'
+    
+    # Validate carbon intensity input
+    if carbon_intensity not in DEFAULT_CARBON_INTENSITY:
+        return f"Invalid carbon intensity. Choose from: {', '.join(DEFAULT_CARBON_INTENSITY.keys())}"
+    
+    # Robust server serial extraction with multiple patterns
+    server_patterns = [
+        r'server\s+([A-Za-z0-9_-]+)',  # "server ABC123"
+        r'([A-Za-z0-9]{6,})',          # Direct alphanumeric codes like "SGH227WTNK"
+        r'([A-Za-z0-9_-]{5,})'         # Alphanumeric with underscores/hyphens
+    ]
+    
+    # Collect all potential server matches
+    potential_servers = set()
+    
+    # Try each pattern to find all server serials
+    for pattern in server_patterns:
+        matches = re.findall(pattern, query, re.IGNORECASE)
+        for match in matches:
+            potential_serial = match.upper().strip()
+            # Check if this serial exists in our data
+            if potential_serial in processed_server_data:
+                potential_servers.add(potential_serial)
+    
+    # Fallback: check if any known server serial appears directly in query
+    query_upper = query.upper()
+    for serial_key in processed_server_data.keys():
+        # Check for exact match or serial as substring with word boundaries
+        if re.search(r'\b' + re.escape(serial_key) + r'\b', query_upper):
+            potential_servers.add(serial_key)
+    
+    # Additional fallback: fuzzy matching for common typos
+    if not potential_servers:
+        # Split query into potential server tokens
+        tokens = re.findall(r'[A-Za-z0-9]{5,}', query)
+        for token in tokens:
+            token_clean = re.sub(r'[^A-Za-z0-9]', '', token.upper())
+            if len(token_clean) >= 5:
+                for serial_key in processed_server_data.keys():
+                    serial_clean = re.sub(r'[^A-Za-z0-9]', '', serial_key)
+                    # Check if cleaned token matches cleaned serial
+                    if token_clean == serial_clean:
+                        potential_servers.add(serial_key)
+                        break
+    
+    found_servers = list(potential_servers)
+    
+    # If no servers found, return helpful error message
+    if not found_servers:
+        available_servers = list(processed_server_data.keys())
+        sample_servers = ', '.join(available_servers[:5])
+        if len(available_servers) > 5:
+            sample_servers += f" (and {len(available_servers) - 5} more)"
         
-        output = f"Carbon footprint analysis for server {server_serial}:\n\n"
+        return (f"No servers found in query. Please check the server serial number(s).\n\n"
+                f"Available servers include: {sample_servers}\n"
+                f"Example usage: 'co2 emission for server {available_servers[0]}' or "
+                f"'{available_servers[0]} and {available_servers[1]} carbon footprint'")
+    
+    # Calculate CO2 emissions for all found servers
+    intensity_factor = DEFAULT_CARBON_INTENSITY[carbon_intensity]
+    results = []
+    total_co2 = 0.0
+    servers_with_data = 0
+    
+    for server_serial in sorted(found_servers):
+        server_data = processed_server_data[server_serial]
+        energy_kwh = server_data.get("estimated_energy_kwh", 0)
+        
+        if energy_kwh == 0:
+            results.append({
+                "serial": server_serial,
+                "error": "No energy consumption data available"
+            })
+            continue
+        
+        # Calculate CO2 emissions
+        co2_kg = energy_kwh * intensity_factor
+        total_co2 += co2_kg
+        servers_with_data += 1
+        
+        # Get efficiency rating
+        avg_cpu = server_data["avg_cpu_util"]
+        
+        # Special case for 0% utilization
+        if avg_cpu == 0:
+            efficiency = "idle"
+            efficiency_note = "Server is idle (0% CPU utilization)"
+        else:
+            # Calculate power ratio only for active servers
+            power_ratio = estimate_power(avg_cpu) / (50 + (300 - 50) * (avg_cpu/100))
+            
+            efficiency = "poor"  # Default to poor
+            for rating, threshold in EFFICIENCY_THRESHOLDS["cpu_power_ratio"].items():
+                if power_ratio <= threshold:
+                    efficiency = rating
+                    break
+            efficiency_note = f"Energy Efficiency Rating: {efficiency.capitalize()}"
+        
+        results.append({
+            "serial": server_serial,
+            "energy_kwh": round(energy_kwh, 2),
+            "co2_kg": round(co2_kg, 2),
+            "avg_cpu": avg_cpu,
+            "efficiency": efficiency,
+            "efficiency_note": efficiency_note
+        })
+    
+    # Format output based on number of servers
+    if len(found_servers) == 1:
+        # Single server detailed output
+        result = results[0]
+        if "error" in result:
+            return f"Server {result['serial']}: {result['error']}"
+        
+        output = f"Carbon footprint analysis for server {result['serial']}:\n\n"
         output += f"   - Energy Consumed: {result['energy_kwh']} kWh\n"
         output += f"   - CO2 Emissions: {result['co2_kg']} kg\n"
         output += f"   - Carbon Intensity: {carbon_intensity.replace('_', ' ').title()} ({intensity_factor} kg CO2/kWh)\n"
         output += f"   - Average CPU Utilization: {result['avg_cpu']}%\n"
+        output += f"   - {result['efficiency_note']}\n"
         
-        if result['efficiency'] == 'idle':
-            output += "   - Energy Efficiency: Server is idle (0% CPU utilization)\n"
-        else:
-            output += f"   - Energy Efficiency Rating: {result['efficiency'].capitalize()}\n"
-            
-        return output
-    
     else:
-        # Multiple servers summary output
+        # Multiple servers output
         grid_type_display = carbon_intensity.replace('_', ' ').title()
-        available_servers = len(results)
+        output = f"Carbon footprint analysis for {len(found_servers)} specified servers ({grid_type_display}):\n\n"
         
-        output = f"Carbon footprint summary for all {available_servers} servers ({grid_type_display}):\n\n"
-        output += f"   - Total CO2 Emissions: {round(total_co2, 2)} kg\n"
-        output += f"   - Average per Server: {round(total_co2/available_servers, 2)} kg\n\n"
+        if servers_with_data > 0:
+            output += f"   - Total CO2 Emissions: {round(total_co2, 2)} kg\n"
+            output += f"   - Average per Server: {round(total_co2/servers_with_data, 2)} kg\n\n"
         
-        if num_servers_to_show == float('inf'):
-            # Show all servers
-            top_count = available_servers
-            output += f"All {available_servers} servers:\n\n"
-        else:
-            # Show requested number of servers
-            top_count = min(int(num_servers_to_show), available_servers)
-            output += f"Top {top_count} highest emitting servers:\n\n"
+        output += "Individual server details:\n\n"
         
-        # Add top N highest emitters
-        sorted_results = sorted(results, key=lambda x: x["co2_kg"], reverse=True)
-        
-        for i, res in enumerate(sorted_results[:top_count]):
-            output += f"{i+1}. Server {res['serial']}:\n"
-            output += f"   - CO2 Emissions: {res['co2_kg']} kg\n"
-            output += f"   - Energy Consumed: {res['energy_kwh']} kWh\n"
-            output += f"   - CPU Utilization: {res['avg_cpu']}%\n"
-            output += f"   - Efficiency Rating: {res['efficiency'].capitalize()}\n\n"
-                
-        # Add efficiency distribution
-        eff_dist = {}
-        for res in results:
-            eff_dist[res["efficiency"]] = eff_dist.get(res["efficiency"], 0) + 1
-        
-        output += "Energy efficiency distribution:\n\n"
-        for eff, count in sorted(eff_dist.items()):
-            percentage = round((count / available_servers) * 100, 1)
-            output += f"   - {eff.capitalize()}: {count} servers ({percentage}%)\n"
+        for i, result in enumerate(results, 1):
+            if "error" in result:
+                output += f"{i}. Server {result['serial']}: {result['error']}\n\n"
+            else:
+                output += f"{i}. Server {result['serial']}:\n"
+                output += f"   - CO2 Emissions: {result['co2_kg']} kg\n"
+                output += f"   - Energy Consumed: {result['energy_kwh']} kWh\n"
+                output += f"   - CPU Utilization: {result['avg_cpu']}%\n"
+                output += f"   - Efficiency: {result['efficiency'].capitalize()}\n\n"
     
     return output
 
@@ -893,9 +1530,9 @@ def get_server_stats(query: str) -> str:
         if data.get('co2_emissions'):
             result += f"  Est. CO2 (avg grid): {data['co2_emissions'].get('average_grid', 'N/A')} kg\n"
         return result.strip()
-    result = "Server Fleet Statistics Summary (Top 5 by Peak CPU shown):\n" + "=" * 50 + "\n\n"
+    result = "Server Fleet Statistics Summary (Top 10 by Peak CPU shown):\n" + "=" * 50 + "\n\n"
     if not processed_server_data: return "No server data available for summary."
-    servers_to_show = server_rankings.get("top_cpu", [])[:5]
+    servers_to_show = server_rankings.get("top_cpu", [])[:10]
     if not servers_to_show:
         result += "No ranked servers to display in summary.\n"
         count = 0
@@ -1646,6 +2283,41 @@ tools = [
     ),
     return_direct=True),
     
+Tool(
+    name="GetServerCPUUtilization",
+    func=get_specific_server_cpu_utilization,
+    description=(
+        "Use this tool to get detailed CPU utilization information for SPECIFIC server(s).\n\n"
+        "The tool uses robust server identification to handle various formats including:\n"
+        "- Full server names (e.g., 'server SGH227WTNK')\n"
+        "- Direct serial numbers (e.g., 'SGH227WTNK')\n"
+        "- Multiple servers in one query (e.g., 'SGH227WTNK and ABC123', 'SGH227WTNK, DEF456')\n"
+        "- Case-insensitive matching\n"
+        "- Handles common typos and formatting variations\n\n"
+        "Example queries:\n"
+        "- 'What is the CPU utilization of server SGH227WTNK?'\n"
+        "- 'Show CPU stats for SGH227WTNK and ABC123'\n"
+        "- 'CPU usage for servers SGH227WTNK, DEF456'\n"
+        "- 'SGH227WTNK CPU utilization details'\n"
+        "- 'Compare CPU usage SGH227WTNK ABC123'\n\n"
+        "Returns detailed analysis:\n"
+        "For single server:\n"
+        "- Average CPU Utilization (%)\n"
+        "- Peak CPU Utilization (%) with timestamp\n"
+        "- Power consumption at peak\n"
+        "- Temperature and fan speed at peak\n"
+        "- CPU efficiency rating\n"
+        "- Fleet ranking position\n\n"
+        "For multiple servers:\n"
+        "- Summary statistics across servers\n"
+        "- Individual server breakdowns\n"
+        "- Comparative analysis with rankings\n\n"
+        "If server(s) not found, returns helpful error message with available server examples.\n\n"
+        "Format: Action: GetServerCPUUtilization[\"<query>\"]"
+    ),
+    return_direct=True
+),
+    
     Tool(
     name="GetLowestServersByCPUUtil",
     func=get_lowest_servers_by_cpu_util,
@@ -1691,6 +2363,32 @@ Tool(
         "- CPU power consumption (Watts) "
         "- DIMM power consumption (Watts) "
         "Handles incomplete data gracefully and informs if requested count exceeds available data."
+    ),
+    return_direct=True
+),
+Tool(
+    name="GetSpecificServerAmbientTemp",
+    func=get_specific_server_ambient_temp,
+    description=(
+        "Use this tool to get ambient temperature data for specific server(s) identified by their serial numbers. "
+        "It can handle single or multiple servers in one query with robust server identification. "
+        "The function accepts natural language queries containing server serial numbers and returns detailed "
+        "ambient temperature information. "
+        "Example queries include: "
+        "'What is the ambient temperature for server SGH227WTNK?', "
+        "'Show ambient temperature data for SGH227WTNK and ABC123', "
+        "'Get temperature info for server XYZ456', "
+        "'SGH227WTNK, DEF456 ambient temperature'. "
+        "For each server, it returns: "
+        "- Server serial number "
+        "- Highest ambient temperature recorded (°C) "
+        "- Average ambient temperature (°C) "
+        "- Timestamp of the highest temperature record "
+        "- CPU utilization (%) at peak temperature "
+        "- CPU power consumption (Watts) at peak "
+        "- DIMM power consumption (Watts) at peak "
+        "Handles multiple servers with summary statistics and gracefully handles missing data. "
+        "Uses the same robust server identification patterns as the CO2 emission function."
     ),
     return_direct=True
 ),
@@ -1741,6 +2439,32 @@ Tool(
         "- Ambient Temperature (°C)\n"
         "- CPU Power (Watts)\n\n"
         "Format: Action: GetTopServersByPeak[\"<query>\"]"
+    ),
+    return_direct=True
+),
+Tool(
+    name="GetSpecificServerPeakData",
+    func=get_specific_server_peak_data,
+    description=(
+        "Use this tool to get peak data for specific server(s) identified by their serial numbers. "
+        "It can handle single or multiple servers in one query with robust server identification. "
+        "The function accepts natural language queries containing server serial numbers and returns detailed "
+        "peak performance information. "
+        "Example queries include: "
+        "'What is the peak data for server SGH227WTNK?', "
+        "'Show peak values for SGH227WTNK and ABC123', "
+        "'Get peak performance for server XYZ456', "
+        "'SGH227WTNK, DEF456 peak data'. "
+        "For each server, it returns: "
+        "- Server serial number "
+        "- Highest peak value recorded "
+        "- Average peak value "
+        "- Timestamp of the highest peak record "
+        "- CPU utilization (%) at peak "
+        "- Ambient temperature (°C) at peak "
+        "- CPU power consumption (Watts) at peak "
+        "Handles multiple servers with summary statistics and gracefully handles missing data. "
+        "Uses the same robust server identification patterns as other specific server functions."
     ),
     return_direct=True
 ),
@@ -1799,30 +2523,65 @@ Tool(
     ),
     return_direct=True
 ),
+
+# Updated Tool Definitions
 Tool(
     name="CalculateCarbonFootprint",
     func=calculate_carbon_footprint,
     description=(
-        "Use this tool to calculate the carbon footprint of one or more servers based on estimated energy consumption.\n\n"
+        "Use this tool to calculate the carbon footprint of multiple servers or fleet-wide analysis.\n\n"
         "The tool determines whether to use 'average', 'low-carbon', or 'high-carbon' grid intensity based on keywords in the query "
-        "(e.g., 'renewable', 'coal', 'low carbon', etc.). It extracts server serial numbers, counts (like 'top 5', 'ten servers', or 'all'), "
+        "(e.g., 'renewable', 'coal', 'low carbon', etc.). It extracts server counts (like 'top 5', 'ten servers', or 'all') "
         "and optionally filters by grid type.\n\n"
-        "If a specific server is mentioned (e.g., 'Server ABC123'), it will return the carbon footprint details for that server only.\n"
-        "If a number of top servers are requested, it returns those with the HIGHEST CO₂ emissions.\n\n"
+        "This tool is for MULTIPLE server analysis only. For individual servers, use CO2EmissionServer instead.\n\n"
         "Example queries:\n"
-        "- 'What is the carbon footprint of server ABC123?'\n"
         "- 'Show CO2 emissions for all servers using renewable energy.'\n"
         "- 'Calculate carbon footprint for top 3 servers using high carbon grid.'\n"
         "- 'List servers with highest emissions based on coal grid.'\n"
-        "- 'Top 10 servers by carbon emissions'\n\n"
-        "Returns for each server:\n"
-        "- Serial number\n"
+        "- 'Top 10 servers by carbon emissions'\n"
+        "- 'Fleet-wide carbon footprint analysis'\n\n"
+        "Returns fleet summary including:\n"
+        "- Total CO₂ Emissions across all servers\n"
+        "- Average emissions per server\n"
+        "- Top N highest emitting servers with details\n"
+        "- Energy efficiency distribution\n\n"
+        "Format: Action: CalculateCarbonFootprint[\"<query>\"]"
+    ),
+    return_direct=True
+),
+
+Tool(
+    name="CO2EmissionServer",
+    func=co2_emission_server,
+    description=(
+        "Use this tool to calculate the carbon footprint of SPECIFIC server(s) - single or multiple.\n\n"
+        "The tool uses robust server identification to handle various formats including:\n"
+        "- Full server names (e.g., 'server SGH227WTNK')\n"
+        "- Direct serial numbers (e.g., 'SGH227WTNK')\n"
+        "- Multiple servers in one query (e.g., 'SGH227WTNK and ABC123', 'SGH227WTNK, DEF456')\n"
+        "- Case-insensitive matching\n"
+        "- Handles common typos and formatting variations\n\n"
+        "Also determines carbon intensity based on keywords in the query "
+        "(e.g., 'renewable', 'coal', 'low carbon', etc.).\n\n"
+        "Example queries:\n"
+        "- 'What is the carbon footprint of server SGH227WTNK?'\n"
+        "- 'CO2 emissions for SGH227WTNK and ABC123 using renewable energy'\n"
+        "- 'Show carbon footprint of servers SGH227WTNK, DEF456 with high carbon grid'\n"
+        "- 'SGH227WTNK ABC123 carbon emissions'\n"
+        "- 'Compare CO2 for SGH227WTNK and DEF456'\n\n"
+        "Returns detailed analysis:\n"
+        "For single server:\n"
         "- Energy Consumed (kWh)\n"
         "- CO₂ Emissions (kg)\n"
+        "- Carbon Intensity used in calculation\n"
         "- Average CPU Utilization (%)\n"
-        "- Efficiency Rating (based on CPU-to-power ratio)\n\n"
-        "Also returns a fleet summary when multiple servers are included.\n\n"
-        "Format: Action: CalculateCarbonFootprint[\"<query>\"]"
+        "- Energy Efficiency Rating\n\n"
+        "For multiple servers:\n"
+        "- Total and average CO₂ emissions\n"
+        "- Individual server breakdowns\n"
+        "- Comparative analysis\n\n"
+        "If server(s) not found, returns helpful error message with available server examples.\n\n"
+        "Format: Action: CO2EmissionServer[\"<query>\"]"
     ),
     return_direct=True
 ),
