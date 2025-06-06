@@ -1724,33 +1724,77 @@ def get_filtered_server_records(query_params_str: str) -> str:
         logger.error(f"Error in get_filtered_server_records: {e}", exc_info=True)
         return f"Unexpected error filtering records: {str(e)}"
 
+def extract_server_name(query: str, all_servers: set) -> Optional[str]:
+    """Extracts a likely server name from the query based on known server IDs."""
+    upper_query = query.upper()
+
+    # Match all uppercase-alphanumeric-underscore-hyphen patterns
+    candidates = re.findall(r'\b[A-Z0-9_\\-]{3,}\b', upper_query)
+    for candidate in candidates:
+        if candidate in all_servers:
+            return candidate
+    return None
 
 def detect_anomalies(query: str) -> str:
+    METRIC_KEYWORDS = {
+    "cpu_util": ["cpu utilization", "cpu util", "cpu usage", "strange behavior in cpu", "cpu load"],
+    "amb_temp": ["ambient temperature", "amb temp", "temperature", "temperature spikes"],
+    "cpu_watts": ["cpu power", "cpu watts", "power consumption", "power usage"],
+    "dimm_watts": ["memory power", "dimm watts", "dimm memory power"],
+}
+    
+    def extract_metrics(query: str) -> List[str]:
+        query = query.lower()
+        matched = []
+        for metric, aliases in METRIC_KEYWORDS.items():
+            for phrase in aliases:
+                if phrase in query:
+                    matched.append(metric)
+                    break
+        return matched if matched else ["cpu_util", "amb_temp", "cpu_watts", "dimm_watts"]
+
+
     # Parse query to determine scope
     analyze_all = True
     specific_server = None
     specific_metric = None
-    
+
     query_lower = query.lower()
-    if "server" in query_lower:
-        parts = query_lower.split("server")
-        if len(parts) > 1:
-            potential_serial = parts[1].strip().upper()
-            if potential_serial in processed_server_data:
-                analyze_all = False
-                specific_server = potential_serial
+    
+    potential_serial = extract_server_name(query, set(processed_server_data.keys()))
+    if potential_serial:
+        analyze_all = False
+        specific_server = potential_serial
+    elif re.search(r"\bserver\b", query.lower()):
+        return f"⚠️ Server mentioned but not found in dataset. Please check the name."
+    # otherwise, proceed with analyze_all = True
+
+
+
     
     # Determine which metric to analyze
-    metrics_to_check = []
-    # In detect_anomalies function, modify:
-    if "cpu" in query_lower or "utilization" in query_lower:
-        metrics_to_check = ["cpu_util"]  # Override instead of append
-    elif "temp" in query_lower or "temperature" in query_lower:
+    metrics_to_check = extract_metrics(query)
+    
+    # Check for multi-word metrics first
+    if "cpu watts" in query_lower or "cpu_watts" in query_lower:
+        metrics_to_check = ["cpu_watts"]
+    elif "dimm watts" in query_lower or "dimm_watts" in query_lower:
+        metrics_to_check = ["dimm_watts"]
+    elif "cpu util" in query_lower or "cpu_util" in query_lower:
+        metrics_to_check = ["cpu_util"]
+    elif "amb temp" in query_lower or "amb_temp" in query_lower:
         metrics_to_check = ["amb_temp"]
-    elif "power" in query_lower or "watts" in query_lower:
+    # Fallback to single-word matches
+    elif "watts" in query_lower:
         metrics_to_check = ["cpu_watts", "dimm_watts"]
+    elif "temp" in query_lower:
+        metrics_to_check = ["amb_temp"]
+    elif "cpu" in query_lower or "util" in query_lower:
+        metrics_to_check = ["cpu_util"]
+    
     if not metrics_to_check:
         metrics_to_check = ["cpu_util", "amb_temp", "cpu_watts", "dimm_watts"]
+
     
     # Enhanced statistical anomaly detection
     def find_anomalies(values, timestamps, metric_name, server_serial):
@@ -1765,10 +1809,18 @@ def detect_anomalies(query: str) -> str:
         if mad == 0:
             return [], median
         
-        # Dynamic threshold based on dataset size
-        base_threshold = 4.0  # Higher base threshold
-        if len(values) > 100:
-            threshold = base_threshold + (len(values) / 1000)  # Scale with dataset size
+        base_threshold = 3.5  # Lower base threshold
+        threshold = base_threshold
+        
+        # More sensitive scaling
+        if len(values) < 10:
+            threshold = 3.0  # Very sensitive for tiny datasets
+        elif len(values) > 100:
+            threshold = base_threshold + (len(values) / 500)  # Faster scaling
+        
+        # Debug output (optional)
+        # print(f"Debug - {metric_name}: Median={median}, MAD={mad}, Threshold={threshold}")
+        # print(f"Values: {values}, Z-scores: {modified_z_scores}")
         
         # Find anomalies with deduplication
         anomalies = []
@@ -1791,7 +1843,7 @@ def detect_anomalies(query: str) -> str:
         return anomalies, median
     
     # Process requested servers
-    servers_to_check = processed_server_data.keys() if analyze_all else [specific_server]
+    servers_to_check = list(processed_server_data.keys()) if analyze_all else [specific_server]
     all_anomalies = []
     median_baselines = {}
     
@@ -2724,8 +2776,7 @@ Tool(
         "- Supports natural language input only.\n\n"
         
         "Format: Action: DetectAnomalies[\"<natural language query>\"]"
-    ),
-    return_direct=True,
+    )
 ),
  Tool(
         name="QueryDocuments",
