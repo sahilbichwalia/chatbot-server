@@ -2776,7 +2776,8 @@ Tool(
         "- Supports natural language input only.\n\n"
         
         "Format: Action: DetectAnomalies[\"<natural language query>\"]"
-    )
+    ),
+    return_direct=True,
 ),
  Tool(
         name="QueryDocuments",
