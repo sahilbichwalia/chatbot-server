@@ -2506,6 +2506,7 @@ Tool(
         "'What is the peak data for server SGH227WTNK?', "
         "'Show peak values for SGH227WTNK and ABC123', "
         "'Get peak performance for server XYZ456', "
+        "'Lowest peak servers abc123',"
         "'SGH227WTNK, DEF456 peak data'. "
         "For each server, it returns: "
         "- Server serial number "
